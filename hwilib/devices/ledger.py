@@ -67,6 +67,7 @@ from .._script import (
     parse_multisig,
 )
 from ..psbt import PSBT
+from .._base58 import decode_check, encode_check
 import logging
 import re
 
@@ -250,6 +251,8 @@ class LedgerClient(HardwareWalletClient):
             is_wit, wit_ver, _ = is_witness(scriptcode)
 
             script_addrtype = AddressType.LEGACY
+            is_tap = False
+            is_tap_asset = False
             if is_wit:
                 if p2sh:
                     if wit_ver == 0:
@@ -261,8 +264,19 @@ class LedgerClient(HardwareWalletClient):
                         script_addrtype = AddressType.WIT
                     elif wit_ver == 1:
                         script_addrtype = AddressType.TAP
+                        is_tap = True
                     else:
                         continue
+
+            # Check if this is a Taproot Asset Pedersen Commitment transaction.
+            # The magic number for the Pedersen Commitment xPub is 7a9a55e7 used
+            # as the fingerprint of that xPub (which is hex leet speak for
+            # "TAP asset", with a bit of artistic license).
+            pedersen_xpub_fingerprint = "7a9a55e7"
+            if is_tap and len(psbt_in.tap_bip32_paths) == 2:
+                for pub, (hashes, pk_origin) in psbt_in.tap_bip32_paths.items():
+                    if pk_origin.fingerprint.hex() == pedersen_xpub_fingerprint:
+                        is_tap_asset = True
 
             # Check if P2WSH
             if is_p2wsh(scriptcode):
@@ -307,6 +321,61 @@ class LedgerClient(HardwareWalletClient):
                         msw,
                         registered_hmac,
                     )
+
+            elif is_tap_asset:
+                # For signing Taproot Asset specific transactions, we use a
+                # simple miniscript policy that the Ledger device can
+                # understand. The first key (@0) is always a key derived from
+                # the device itself and is used as the Taproot internal key. The
+                # second key (@1) is the Pedersen Commitment key that commits to
+                # the payload in question. The base key used for the Pedersen
+                # Commitment is a well-known NUMS key that is tweaked with the
+                # payload, then converted into an extended public key. So any
+                # key derived from that extended key is also un-spendable.
+                template = "tr(@0/**,pk(@1/**))"
+
+                # We already checked that we have exactly two keys in the
+                # Taproot bip32 paths. So we just need to map them to the first
+                # and second key (the order is important for the policy but in
+                # the PSBT it might not be in that order, but we can match by
+                # the fingerprint as one will be the Pedersen Commitment magic
+                # fingerprint and the other will be the master fingerprint of
+                # the device itself).
+                key1_str = ""
+                key2_str = ""
+                for key, (leaf_hashes, origin) in psbt_in.tap_bip32_paths.items():
+                    if key == psbt_in.tap_internal_key and origin.fingerprint == master_fp:
+                        path = [H_(get_bip44_purpose(script_addrtype)), H_(get_bip44_chain(self.chain)), H_(origin.path[2])]
+                
+                        origin = KeyOriginInfo(self.get_master_fingerprint(), path)
+                        pk_prov = PubkeyProvider(origin, self.get_pubkey_at_path(f"m{origin._path_string()}").to_string(), None)
+                        key1_str = pk_prov.to_string(hardened_char="'")
+                        
+                    if origin.fingerprint.hex() == pedersen_xpub_fingerprint:
+                        for global_key, global_origin in psbt2.xpub.items():
+                            if global_origin.fingerprint == origin.fingerprint:
+                                pk_prov = PubkeyProvider(global_origin, encode_check(global_key), None)
+                                key2_str = pk_prov.to_string(hardened_char="'")
+
+                if key1_str == "" or key2_str == "":
+                    raise BadArgumentError("Could not find the required keys for constructing the Taproot Asset signing policy")
+
+                # Make the Wallet object now and register it with the device.
+                name = "Taproot Asset Pedersen Commitment"
+                policy = WalletPolicy(name=name, descriptor_template=template, keys_info=[key1_str, key2_str])
+                if policy.id not in wallets:
+                    print("Registering wallet policy with name: ", name,
+                          " and keys: ", [key1_str, key2_str], 
+                          " with device. Please confirm on device.")
+                    _, registered_hmac = self.client.register_wallet(policy)
+                    print("Registered wallet policy successfully.")
+                    wallets[policy.id] = (
+                        signing_priority[script_addrtype],
+                        script_addrtype,
+                        policy,
+                        registered_hmac,
+                    )
+                
             else:
                 def process_origin(origin: KeyOriginInfo) -> None:
                     if not is_standard_path(origin.path, script_addrtype, self.chain):
